@@ -125,3 +125,111 @@ categoría. Se descartó un `switch` sobre `CategoriaGasto`.
 - **No es una Factory.** El selector no crea nada; las calculadoras
   las construye el contenedor. Por eso no se agregó un Factory Method
   propio encima de la inyección de dependencias.
+
+### Decisión 3 — Capas simples para la persistencia (resumen de ADR-001)
+El detalle completo está en [docs/adr/ADR-001.md](docs/adr/ADR-001.md).
+
+- **Persistencia: no se introduce un puerto.**
+  `SolicitudReembolsoService` sigue dependiendo de
+  `RepositorioSolicitudesJpa`. El criterio de la guía (sección 6.2)
+  pide un sistema que vaya a vivir tres años o más con cambios de
+  infraestructura, y aquí no hay ningún plan de cambiar de motor. El
+  repositorio se usa en una sola clase y con tres métodos, y las
+  reglas de negocio ya se prueban sin base de datos porque están en
+  `procesamiento`. Un puerto hoy tendría un solo implementador.
+- **Notificación: no se cambia nada.** Aquí sí hay un cambio con
+  fecha (la API de Contabilidad el próximo trimestre), pero
+  `ObservadorCambioEstado` ya es el punto de extensión: basta cambiar
+  el cuerpo de `NotificadorContabilidad`.
+- **Costo aceptado.** Si se cambia de motor habrá que introducir el
+  puerto después, y cuando Contabilidad sea una llamada externa habrá
+  que revisar que los observadores se ejecutan uno tras otro dentro de
+  la misma petición.
+
+### Decisión 4 — La Regla 1 prohíbe Spring Data y JPA, no todo Spring
+La regla existe para garantizar que validar, calcular y notificar se
+puedan ejecutar sin base de datos y sin capa web. Por eso distingue
+dos tipos de dependencia:
+
+- **`@Component` es una etiqueta.** No cambia lo que hace la clase ni
+  lo que necesita para funcionar: las 30 pruebas unitarias de
+  `procesamiento` crean los validadores y las calculadoras con `new`,
+  sin Spring. En cambio, depender de `JpaRepository` o de una clase
+  web sí cambia lo que la clase necesita para ejecutarse.
+- **Prohibir todo `org.springframework` rompería RF2 y RF3.** Sin
+  estereotipos, los once componentes de `procesamiento` habría que
+  declararlos a mano en una clase de configuración, y cada calculadora
+  u observador nuevo obligaría a editarla. La inyección de
+  `List<CalculadoraReembolso>` y `List<ObservadorCambioEstado>`, que
+  es lo que permite agregar sin modificar, depende de que Spring
+  encuentre esos `@Component`.
+- **Costo aceptado.** `procesamiento` no es Java puro: necesita
+  `spring-context` para compilar y no se puede llevar tal cual a un
+  proyecto sin Spring. Se acepta porque lo que la regla protege es la
+  dirección de las dependencias hacia persistencia y web, no la
+  independencia total del framework.
+
+## Qué se descartó y por qué
+Las cinco ideas siguientes aparecieron durante el diseño y no se
+implementaron. Ninguna es un descarte definitivo: cada una indica qué
+señal haría reconsiderarla.
+
+### 1. Patrón State para `EstadoSolicitud` (propio)
+- **Qué se consideró.** Una clase por estado (pendiente, aprobada,
+  rechazada, requiere corrección) que decidiera a qué estados se puede
+  pasar. Parecía encajar porque hay cuatro estados y un método
+  `cambiarEstado`.
+- **Por qué se descartó.** Ningún requisito define transiciones
+  prohibidas ni un comportamiento distinto según el estado. No pasa el
+  test de explicabilidad: no se puede decir en una oración qué
+  problema de hoy resuelve. Serían cuatro clases para reglas que
+  todavía no existen (YAGNI).
+- **Qué haría reconsiderarlo.** Que Finanzas defina la primera regla
+  de transición, por ejemplo que una solicitud rechazada no pueda
+  aprobarse sin pasar por corrección. Con una o dos reglas alcanza una
+  validación en el servicio; cuando cada estado tenga comportamiento
+  propio, State.
+
+### 2. Topes configurables en lugar de constantes (propio)
+- **Qué se consideró.** Sacar los topes (150.000, 2.000.000,
+  3.000.000) a `application.properties` o a una tabla, para cambiarlos
+  sin recompilar. Era tentador porque el mismo valor aparece en
+  `ValidadorMontoMaximo` y en las calculadoras.
+- **Por qué se descartó.** No hay ningún requisito de cambiar topes
+  sin desplegar y no ha habido ni un solo cambio de tope. La Rule of
+  Three pide esperar a la tercera repetición antes de abstraer; aquí
+  no hay ni la primera.
+- **Qué haría reconsiderarlo.** Un segundo cambio de tope en un mismo
+  semestre, o que Finanzas pida ajustarlos sin depender de
+  desarrollo.
+
+### 3. Una excepción por cada validador (propio)
+- **Qué se consideró.** `DocumentosFaltantesException`,
+  `MontoExcedidoException` y `SolicitudDuplicadaException` en lugar de
+  una sola `SolicitudInvalidaException` con el motivo como texto.
+- **Por qué se descartó.** Los tres rechazos se tratan igual: el
+  controlador responde 422 con el motivo. Tres clases que nadie
+  distingue no aportan nada, y cada validador nuevo obligaría a crear
+  otra excepción y a tocar el manejador de errores.
+- **Qué haría reconsiderarlo.** Que algún rechazo necesite un trato
+  distinto, por ejemplo otro código HTTP o un reintento automático.
+
+### 4. `ApplicationEventPublisher` en lugar de la lista de observadores (referencia del enunciado)
+- **Qué se consideró.** Publicar un evento de dominio y reaccionar con
+  `@EventListener`.
+- **Por qué se descartó.** Con tres observadores conocidos en tiempo
+  de compilación, la interfaz `ObservadorCambioEstado` ya desacopla al
+  servicio. Un bus de eventos agrega una indirección más y hace más
+  difícil encontrar en el código quién reacciona a qué.
+- **Qué haría reconsiderarlo.** Que los interesados deban ejecutarse
+  de forma asíncrona o después de confirmar la transacción, algo que
+  puede pasar con la integración de Contabilidad.
+
+### 5. Exportadores en varios formatos con Visitor o Abstract Factory (referencia del enunciado)
+- **Qué se consideró.** Preparar una jerarquía de exportadores para
+  PDF y Excel además de CSV.
+- **Por qué se descartó.** Hoy solo existe el requisito de CSV. No se
+  cumple la Rule of Three: no hay una segunda solicitud real de otro
+  formato.
+- **Qué haría reconsiderarlo.** Una segunda petición concreta de
+  formato por parte de Contabilidad.
