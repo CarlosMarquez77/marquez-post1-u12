@@ -233,3 +233,168 @@ señal haría reconsiderarla.
   formato.
 - **Qué haría reconsiderarlo.** Una segunda petición concreta de
   formato por parte de Contabilidad.
+
+## Arquitectura resultante
+
+```
+src/main/java/com/empresa/reembolsos/
+├── dominio/                    SolicitudReembolso, CategoriaGasto, EstadoSolicitud (Java puro)
+├── procesamiento/
+│   ├── validacion/             Chain of Responsibility: ValidadorSolicitud y tres eslabones
+│   ├── calculo/                Strategy: CalculadoraReembolso, tres calculadoras y el selector
+│   └── notificacion/           Observer: ObservadorCambioEstado y tres notificadores
+├── aplicacion/                 SolicitudReembolsoService coordina los tres patrones
+├── infraestructura/            RepositorioSolicitudesJpa (Spring Data JPA)
+└── adaptadores/rest/           SolicitudReembolsoController y manejo de errores
+```
+
+```
+adaptadores.rest ──▶ aplicacion ──▶ procesamiento ──▶ dominio
+                         │                               ▲
+                         └──▶ infraestructura ───────────┘
+```
+
+Las dependencias van en un solo sentido. `procesamiento` y `dominio`
+no conocen ni la base de datos ni la capa web, y el único que habla
+con el repositorio es el servicio de aplicación. Las cuatro reglas de
+`ReglasArquitectura` verifican esos límites en cada push.
+
+## Cómo ejecutar
+```
+mvn spring-boot:run                         # API en http://localhost:8080/api/solicitudes
+mvn verify                                  # 38 pruebas: 30 unitarias y 8 de integración
+mvn test -Dtest=ReglasArquitectura          # 4 reglas de arquitectura
+```
+
+## Evidencia de funcionamiento
+Salida real de la API con la aplicación en ejecución.
+
+Crear una solicitud de cada categoría (el monto aprobado sale de la
+fórmula de cada una):
+
+```
+POST /api/solicitudes  {"empleadoId":"E-100","categoria":"VIAJE","montoSolicitado":120000,"fechaGasto":"2026-10-05","diasViaje":2,"documentosSoporte":true}
+HTTP 200  {"id":1,"categoria":"VIAJE","montoSolicitado":120000,"montoAprobado":120000,"estado":"PENDIENTE", ...}
+
+POST /api/solicitudes  {"empleadoId":"E-100","categoria":"REPRESENTACION","montoSolicitado":850000,"fechaGasto":"2026-10-06","documentosSoporte":true}
+HTTP 200  {"id":2,"categoria":"REPRESENTACION","montoSolicitado":850000,"montoAprobado":850000,"estado":"PENDIENTE", ...}
+
+POST /api/solicitudes  {"empleadoId":"E-100","categoria":"CAPACITACION","montoSolicitado":1000000,"fechaGasto":"2026-10-07","documentosSoporte":true}
+HTTP 200  {"id":3,"categoria":"CAPACITACION","montoSolicitado":1000000,"montoAprobado":800000.0,"estado":"PENDIENTE", ...}
+```
+
+Los tres rechazos de la cadena de validación:
+
+```
+POST (VIAJE sin documentos soporte)
+HTTP 422  {"error":"Faltan documentos soporte"}
+
+POST (REPRESENTACION por 2.500.000)
+HTTP 422  {"error":"Monto excede el tope de la categoria REPRESENTACION"}
+
+POST (segunda solicitud de VIAJE del mismo empleado en octubre)
+HTTP 422  {"error":"Ya existe una solicitud pendiente de la misma categoria en el periodo"}
+```
+
+Cambio de estado y notificaciones en la consola. Contabilidad solo
+reacciona a la aprobación:
+
+```
+PUT /api/solicitudes/1/estado  "APROBADA"   → HTTP 200
+  Auditoria: solicitud 1 cambio de PENDIENTE a APROBADA
+  Contabilidad: programar pago de 120000.00 para E-100
+  Notificando a E-100: su solicitud paso de PENDIENTE a APROBADA
+
+PUT /api/solicitudes/2/estado  "RECHAZADA"  → HTTP 200
+  Auditoria: solicitud 2 cambio de PENDIENTE a RECHAZADA
+  Notificando a E-100: su solicitud paso de PENDIENTE a RECHAZADA
+```
+
+## Evidencia del pipeline
+El workflow `.github/workflows/arquitectura.yml` ejecuta primero las
+reglas de arquitectura y después la suite completa. El historial
+muestra el build fallido por la violación intencional y el build en
+verde después de revertirla:
+
+| Run | Commit | Resultado |
+|-----|--------|-----------|
+| [#1](https://github.com/CarlosMarquez77/marquez-post1-u12/actions/runs/38086109708) | `ac51030` docs: documentar analisis de impacto… | Success |
+| [#2](https://github.com/CarlosMarquez77/marquez-post1-u12/actions/runs/38086194155) | `8e5ac40` test: violacion de arquitectura intencional | **Failure** en "Ejecutar reglas de arquitectura" |
+| [#3](https://github.com/CarlosMarquez77/marquez-post1-u12/actions/runs/38086270810) | `a0502a7` Revert "test: violacion de arquitectura intencional" | Success |
+
+La violación consistió en declarar un campo de tipo
+`RepositorioSolicitudesJpa` dentro de `ValidadorDuplicados`. Mensaje
+de ArchUnit en el run #2:
+
+```
+Architecture Violation [Priority: MEDIUM] - Rule 'no classes that reside in a package
+'..procesamiento..' should depend on classes that reside in any package
+['..infraestructura..', '..adaptadores..', 'org.springframework.data..', 'jakarta.persistence..']'
+was violated (1 times):
+Field <com.empresa.reembolsos.procesamiento.validacion.ValidadorDuplicados.repositorio> has type
+<com.empresa.reembolsos.infraestructura.RepositorioSolicitudesJpa> in (ValidadorDuplicados.java:0)
+```
+
+Historial de GitHub Actions con el build fallido y el build en verde:
+
+![Historial del pipeline](docs/capturas/01-historial-pipeline.png)
+
+Detalle del build fallido por la Regla 1:
+
+![Build fallido por la violación](docs/capturas/02-build-fallido-regla1.png)
+
+## Ajustes sobre el código de la guía
+Se hicieron solo los cambios necesarios para que el proyecto cumpla lo
+que el propio enunciado exige:
+
+- **Mapeo JPA en `META-INF/orm.xml`.** El enunciado pide que el
+  dominio no importe JPA y, a la vez, que `RepositorioSolicitudesJpa`
+  extienda `JpaRepository<SolicitudReembolso, Long>`. Con anotaciones
+  no se pueden cumplir las dos cosas; con el mapeo en XML,
+  `SolicitudReembolso` sigue siendo Java puro.
+- **Regla 2.** Tal como viene, falla contra el propio controlador,
+  porque leer su campo `servicio` cuenta como acceder a una clase de
+  `adaptadores.rest`, que no estaba en la lista. Se agregó ese
+  paquete.
+- **Regla 3.** Tal como viene, marca a `SelectorCalculadora` y a las
+  clases de prueba del paquete, que no son calculadoras. Se limitó a
+  las clases cuyo nombre empieza por `Calculadora` y se excluyeron las
+  pruebas del análisis.
+- **Violación intencional.** Un `import` sin usar no llega al
+  bytecode, que es lo que analiza ArchUnit, así que no hace fallar la
+  regla. Por eso la violación se hizo con un campo.
+- **Manejo de errores.** Se agregó `ManejadorErroresRest` para que un
+  rechazo responda 422 con su motivo, como pide el checkpoint del
+  Paso 5.
+
+Observaciones que no se corrigieron porque son reglas de negocio del
+enunciado, no errores de implementación:
+
+- `ValidadorMontoMaximo` usa 150.000 como tope total de VIAJE, que es
+  el tope diario de `CalculadoraViaje`. Un viaje de tres días por
+  400.000 se rechaza antes de llegar a la fórmula de tope diario por
+  días.
+- `ValidadorDuplicados` compara el mes sin el año.
+- Una categoría nueva sí obliga a agregar su tope en
+  `ValidadorMontoMaximo`; si falta, la validación falla con
+  `NullPointerException`.
+
+## Herramientas utilizadas
+- Java 17, Spring Boot 3.3, Spring Web, Spring Data JPA, H2
+- JUnit 5, ArchUnit 1.2.1, Apache Maven
+- GitHub Actions, Git, GitHub
+
+## Conclusiones
+Lo más distinto de este proyecto fue empezar por el análisis y no por
+el código: al escribir primero qué variaba en cada requisito, los tres
+patrones salieron de los requisitos y no al revés. También me costó
+más decidir qué no hacer que qué hacer. State, los topes configurables
+y el puerto de persistencia eran soluciones correctas, pero para
+problemas que el sistema todavía no tiene, y dejarlas por escrito con
+la señal que las haría volver me pareció más útil que implementarlas.
+Las reglas de ArchUnit convirtieron la arquitectura en algo que falla
+en el pipeline cuando alguien la rompe, y de paso mostraron que dos
+reglas no evaluaban lo que decían hasta que se ejecutaron. Para mí esa
+es la idea que queda del curso: un patrón o una regla se justifica por
+el problema concreto que resuelve y por la evidencia de que lo
+resuelve.
