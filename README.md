@@ -74,3 +74,54 @@ aplicación que existiría de todas formas.
 | RF1 | Las verificaciones previas a la aprobación | Chain of Responsibility | `procesamiento.validacion` |
 | RF2 | La fórmula del monto aprobado | Strategy | `procesamiento.calculo` |
 | RF3 | Los interesados en un cambio de estado | Observer | `procesamiento.notificacion` |
+
+## Decisiones de diseño
+
+### Decisión 1 — Orden de la cadena: documentos, monto, duplicados
+El eslabón más caro va al final.
+
+| Eslabón | Qué hace | Costo |
+|---------|----------|-------|
+| `ValidadorDocumentosSoporte` | Lee un booleano de la solicitud | Constante |
+| `ValidadorMontoMaximo` | Busca el tope en un mapa y compara | Constante |
+| `ValidadorDuplicados` | Recorre las solicitudes pendientes del empleado | Crece con la lista |
+
+- **Qué se gana.** Una solicitud que falla por algo evidente (sin
+  documentos o por encima del tope) se rechaza sin recorrer la lista
+  de pendientes. Si duplicados fuera primero, todas las solicitudes
+  pagarían ese recorrido, incluidas las que iban a fallar por un
+  booleano.
+- **Qué se pierde.** El empleado solo ve el primer motivo. Si a la
+  solicitud le faltan documentos y además está duplicada, corrige los
+  documentos y recién entonces se entera del duplicado.
+  `CadenaValidadoresTest` deja fijo ese comportamiento.
+- **Límite de la ganancia.** `SolicitudReembolsoService.crear()`
+  consulta las pendientes en la base de datos antes de llamar a la
+  cadena, así que esa consulta se paga siempre; el orden solo ahorra
+  el recorrido en memoria. Para ahorrar también la consulta habría que
+  entregar la lista de forma diferida, lo que cambia la firma de los
+  validadores y hoy no se justifica: un empleado tiene pocas
+  solicitudes pendientes.
+
+### Decisión 2 — Selección de la calculadora con un mapa armado por Spring
+`SelectorCalculadora` recibe la `List<CalculadoraReembolso>` que
+Spring inyecta con todos los `@Component` y arma un mapa por
+categoría. Se descartó un `switch` sobre `CategoriaGasto`.
+
+- **Frente al RF2.** Para agregar "bienestar" se crea
+  `CalculadoraBienestar` con `@Component` y el selector, el servicio y
+  las tres calculadoras existentes no cambian. Con el `switch` habría
+  que editar el selector con cada categoría, que es justo lo que el
+  requisito pide evitar, y si se olvida la rama el error aparece en
+  ejecución.
+- **Qué controla el mapa.** Dos calculadoras con la misma categoría
+  hacen fallar `Collectors.toMap` al arrancar, no en la primera
+  solicitud. Una categoría sin calculadora termina en
+  `IllegalArgumentException("Categoria no soportada")`, cubierto por
+  `SelectorCalculadoraTest`.
+- **Costo.** La selección deja de estar escrita en un solo lugar: para
+  saber qué categorías están soportadas hay que buscar las
+  implementaciones de la interfaz.
+- **No es una Factory.** El selector no crea nada; las calculadoras
+  las construye el contenedor. Por eso no se agregó un Factory Method
+  propio encima de la inyección de dependencias.
